@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head></head>
+<body>
+<script>
+window['ai_edge_gallery_get_result'] = async (data) => {
+  try {
+    const files = await pickDicomFiles();
+    if (!files || files.length === 0) {
+      return JSON.stringify({ error: 'No files selected.' });
+    }
+
+    const parsed = [];
+    for (const file of files) {
+      const meta = await parseDicomMeta(file);
+      parsed.push(meta);
+    }
+
+    const groups = {};
+    for (const item of parsed) {
+      const key = item.seriesDescription || 'Unknown Series';
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(item);
+    }
+
+    const summary = Object.entries(groups).map(([series, items]) => ({
+      series,
+      count: items.length,
+      files: items.map(i => i.filename)
+    }));
+
+    const encoded = encodeURIComponent(JSON.stringify(summary));
+    return JSON.stringify({
+      result: buildSummaryText(summary),
+      webview: {
+        url: 'webview.html?data=' + encoded,
+        aspectRatio: 1.4
+      }
+    });
+  } catch (e) {
+    return JSON.stringify({ error: 'Failed: ' + e.message });
+  }
+};
+
+function pickDicomFiles() {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.accept = '.dcm,.dicom,application/dicom,*';
+    input.onchange = () => resolve(Array.from(input.files || []));
+    input.oncancel = () => resolve([]);
+    input.click();
+  });
+}
+
+async function parseDicomMeta(file) {
+  const buffer = await file.arrayBuffer();
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+
+  const meta = { filename: file.name, seriesDescription: null };
+
+  // DICOM preamble is 128 bytes + 4 byte magic "DICM"
+  let offset = 0;
+  const hasMagic =
+    bytes[128] === 0x44 && bytes[129] === 0x49 &&
+    bytes[130] === 0x43 && bytes[131] === 0x4D;
+
+  offset = hasMagic ? 132 : 0;
+
+  let littleEndian = true;
+
+  while (offset + 8 < bytes.length) {
+    try {
+      const group = view.getUint16(offset, littleEndian);
+      const element = view.getUint16(offset + 2, littleEndian);
+      offset += 4;
+
+      // Read VR (2 bytes) - explicit VR
+      const vr = String.fromCharCode(bytes[offset], bytes[offset + 1]);
+      const isExplicitVR = /^[A-Z]{2}$/.test(vr);
+
+      let length;
+      if (isExplicitVR && ['OB','OW','SQ','UC','UN','UR','UT'].includes(vr)) {
+        offset += 4; // 2 VR + 2 reserved
+        length = view.getUint32(offset, littleEndian);
+        offset += 4;
+      } else if (isExplicitVR) {
+        offset += 2; // skip VR
+        length = view.getUint16(offset, littleEndian);
+        offset += 2;
+      } else {
+        // Implicit VR - length is 4 bytes from current offset
+        length = view.getUint32(offset, littleEndian);
+        offset += 4;
+      }
+
+      if (length === 0xFFFFFFFF) {
+        // Undefined length - skip
+        offset += 4;
+        continue;
+      }
+
+      // Tag (0008,103E) = Series Description
+      if (group === 0x0008 && element === 0x103E) {
+        const raw = bytes.slice(offset, offset + length);
+        meta.seriesDescription = new TextDecoder('utf-8')
+          .decode(raw).replace(/\0/g, '').trim() || 'Unnamed Series';
+        break;
+      }
+
+      // Stop scanning after pixel data tag (7FE0,0010) to avoid huge reads
+      if (group === 0x7FE0 && element === 0x0010) break;
+
+      offset += length;
+    } catch {
+      break;
+    }
+  }
+
+  if (!meta.seriesDescription) {
+    meta.seriesDescription = 'Unknown Series';
+  }
+
+  return meta;
+}
+
+function buildSummaryText(summary) {
+  const total = summary.reduce((s, g) => s + g.count, 0);
+  const groupLines = summary.map(g => `- "${g.series}": ${g.count} file(s)`).join('\n');
+  return `Parsed ${total} DICOM file(s) across ${summary.length} series:\n${groupLines}`;
+}
+</script>
+</body>
+</html>
